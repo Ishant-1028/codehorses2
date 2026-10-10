@@ -1,0 +1,12 @@
+go 1.24
+
+use (
+	./packages/cf
+	./packages/ledger
+	./packages/scoring-rules
+	./packages/store
+	./services/api
+	./services/gateway
+	./services/ingest
+	./services/scoring
+)

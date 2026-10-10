@@ -1,0 +1,25 @@
+# One Dockerfile builds every Go service — pass SERVICE=<name> at build.
+# Multi-stage: workspace-aware compile, distroless runtime.
+
+FROM golang:1.24-alpine AS build
+ARG SERVICE
+WORKDIR /src
+RUN apk add --no-cache git
+
+# Copy workspace declaration + every module up front so the build cache
+# is invalidated only when go.sum/go.mod actually change.
+COPY go.work go.work.sum ./
+COPY packages/ packages/
+COPY services/ services/
+
+# The workspace is already wired via go.work — no `go mod download` on
+# the outer module. Build the named service directly.
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=0 GOOS=linux \
+    go build -ldflags="-s -w" -o /out/app ./services/${SERVICE}
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/app /app
+USER nonroot:nonroot
+ENTRYPOINT ["/app"]

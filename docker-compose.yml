@@ -1,0 +1,121 @@
+# Local dev + a demo of horizontal scaling.
+#
+# The single-writer constraint (Codeforces 0.5 req/sec) means ingest
+# runs as one replica — that pod is authoritative for the CF API budget.
+# Every other service is stateless-per-contest and scales out freely:
+#
+#   docker compose up --scale scoring=4 --scale gateway=3 --scale api=2
+#
+# The scoring service uses Redis consumer groups (share XREADGROUP name),
+# so N replicas fair-share the per-contest event stream automatically.
+# The gateway is sticky-routed by contest_id upstream (nginx below shows
+# one shape); each replica holds ~500k WS at production tuning.
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports: ["6379:6379"]
+    volumes: ["redis-data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: codehorses
+      POSTGRES_PASSWORD: codehorses
+      POSTGRES_DB: codehorses
+    ports: ["5432:5432"]
+    volumes: ["pg-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codehorses"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  # Single-writer by design — DO NOT scale.
+  ingest:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args:
+        SERVICE: ingest
+    depends_on:
+      redis: { condition: service_healthy }
+    environment:
+      REDIS_ADDR: redis:6379
+      CF_API_KEY: ${CF_API_KEY:-}
+      CF_API_SECRET: ${CF_API_SECRET:-}
+    restart: unless-stopped
+
+  # Horizontally scalable via consumer groups. Try: --scale scoring=4
+  scoring:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args:
+        SERVICE: scoring
+    depends_on:
+      redis: { condition: service_healthy }
+    environment:
+      REDIS_ADDR: redis:6379
+    restart: unless-stopped
+
+  # Horizontally scalable, sticky by contest_id upstream. Try: --scale gateway=3
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args:
+        SERVICE: gateway
+    depends_on:
+      redis: { condition: service_healthy }
+    environment:
+      REDIS_ADDR: redis:6379
+      LISTEN_ADDR: ":8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+  # Nginx load balancer with sticky WS routing for gateway service.
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      gateway: { condition: service_healthy }
+    ports: ["8080:80"]
+    volumes:
+      - ./docker/nginx-sticky.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+
+  # Horizontally scalable, stateless. Try: --scale api=2
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.service
+      args:
+        SERVICE: api
+    depends_on:
+      redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      REDIS_ADDR: redis:6379
+      LISTEN_ADDR: ":8081"
+      POSTGRES_DSN: postgres://codehorses:codehorses@postgres:5432/codehorses?sslmode=disable
+    ports: ["8081-8083:8081"]
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  pg-data:
